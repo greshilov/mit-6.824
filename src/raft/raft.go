@@ -347,7 +347,6 @@ func (rf *Raft) sendRequestVote(server int, candidateId int, term int, lastLogIn
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-
 	rf.mu.Lock()
 	index := len(rf.log)
 	term := rf.currentTerm
@@ -591,8 +590,12 @@ func (rf *Raft) startVote() {
 	if elected {
 
 		if rf.state == CANDIDATE {
-			DPrintf("[%d] Elected at term %d", rf.me, rf.currentTerm)
 			rf.state = LEADER
+
+			// Clean nextIndex
+			for i := range rf.nextIndex {
+				rf.nextIndex[i] = rf.log[len(rf.log)-1].Index
+			}
 
 			// Leader ping
 			go rf.startPing()
