@@ -1,9 +1,12 @@
 package raft
 
-import "log"
+import (
+	"log"
+	"sort"
+)
 
 // Debugging
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -25,3 +28,14 @@ func max(a, b int) int {
 	}
 	return b
 }
+
+func getMajority(array []int) int {
+	m := make([]int, len(array))
+	copy(m, array)
+
+	sort.Ints(m)
+
+	return m[len(m)/2]
+}
+
+type Empty struct{}
