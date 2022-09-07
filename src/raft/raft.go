@@ -199,8 +199,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term        int
+	Success     bool
+	FirstTermId int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -222,6 +223,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintf("[%d] Log doesn't contain at index %d term %d from [%d]", rf.me, args.PrevLogIndex, args.PrevLogTerm, args.LeaderId)
 		reply.Success = false
 		rf.lastBeatFromLeader = time.Now()
+
+		// Find first index in current term
+		// optimization that backs up nextIndex by more than one entry at a time
+		startIndex := min(args.PrevLogIndex, len(rf.log)-1)
+		failedTerm := rf.log[startIndex].Term
+		for i := startIndex; i >= 0; i-- {
+			if rf.log[i].Term != failedTerm {
+				reply.FirstTermId = i + 1
+				return
+			}
+		}
+
 		return
 	}
 
@@ -499,12 +512,17 @@ func (rf *Raft) broadcastToPeer(peer int) {
 				if response.Term > rf.currentTerm {
 					rf.becomeFollower(response.Term)
 				} else {
-					rf.nextIndex[peer] = max(rf.nextIndex[peer]-1, 0)
-					DPrintf("[%d] Decreasing index %d for [%d]", rf.me, rf.nextIndex[peer], peer)
+
+					newIndx := max(response.FirstTermId-1, 0)
+					DPrintf("[%d] Decreasing index %d -> %d for [%d]", rf.me, rf.nextIndex[peer], newIndx, peer)
+					rf.nextIndex[peer] = newIndx
 				}
 			} else {
-				rf.nextIndex[peer] = max(rf.nextIndex[peer]-1, 0)
-				DPrintf("[%d] Decreasing index %d for [%d]", rf.me, rf.nextIndex[peer], peer)
+				DPrintf("[%d] Missing RPC response [%d]", rf.me, peer)
+				return false
+				// newIndx := max(rf.nextIndex[peer]-1, 0)
+				// DPrintf("[%d] Decreasing index %d -> %d for [%d]", rf.me, rf.nextIndex[peer], newIndx, peer)
+				// rf.nextIndex[peer] = newIndx
 			}
 			rf.persist()
 			return false
