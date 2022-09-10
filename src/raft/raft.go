@@ -271,31 +271,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 5) If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {
-		startIndex := rf.commitIndex
 		endIndex := min(args.LeaderCommit, rf.log[len(rf.log)-1].Index)
 
 		DPrintf("[%d] Setting commit index to %d", rf.me, endIndex)
 		rf.commitIndex = endIndex
-
-		DPrintf("[%d] Sending entries [%d->%d] to client", rf.me, startIndex+1, endIndex)
-		for _, entry := range rf.log[startIndex+1 : endIndex+1] {
-			rf.sendToClient(entry)
-		}
 		persist = true
 	}
 
 	if persist {
 		rf.persist()
 	}
-}
-
-func (rf *Raft) sendToClient(entry LogEntry) {
-	msg := ApplyMsg{}
-	msg.Command = entry.Command
-	msg.CommandIndex = entry.Index
-	msg.CommandValid = true
-
-	rf.ch <- msg
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs) (bool, AppendEntriesReply) {
@@ -520,9 +505,6 @@ func (rf *Raft) broadcastToPeer(peer int) {
 			} else {
 				DPrintf("[%d] Missing RPC response [%d]", rf.me, peer)
 				return false
-				// newIndx := max(rf.nextIndex[peer]-1, 0)
-				// DPrintf("[%d] Decreasing index %d -> %d for [%d]", rf.me, rf.nextIndex[peer], newIndx, peer)
-				// rf.nextIndex[peer] = newIndx
 			}
 			rf.persist()
 			return false
@@ -583,20 +565,14 @@ func (rf *Raft) startPing() {
 		replicatedCommit := getMajority(rf.nextIndex)
 
 		if replicatedCommit > rf.commitIndex && rf.log[replicatedCommit].Term == rf.currentTerm {
-			startIndex := rf.commitIndex
-
 			DPrintf("[%d] Commiting entry with index %d", rf.me, rf.commitIndex)
 			rf.commitIndex = replicatedCommit
-
-			DPrintf("[%d] Sending entry from %d to %d", rf.me, startIndex+1, replicatedCommit+1)
-			for _, entry := range rf.log[startIndex+1 : replicatedCommit+1] {
-				rf.sendToClient(entry)
-			}
 			rf.persist()
 		}
 
 		rf.mu.Unlock()
 
+		DPrintf("[%d] Broadcasting ping to peers", rf.me)
 		for other, _ := range rf.peers {
 			go rf.broadcastToPeer(other)
 		}
@@ -687,7 +663,7 @@ func (rf *Raft) startVote() {
 		}
 	} else {
 		DPrintf("[%d] Wasn't elected at all", rf.me)
-		//rf.currentTerm -= 1
+		rf.currentTerm -= 1
 	}
 	rf.persist()
 }
@@ -716,6 +692,40 @@ func (rf *Raft) ticker() {
 			// Start the election
 			rf.startVote()
 		}
+	}
+}
+
+func (rf *Raft) clientSender() {
+	const SENDER_TICK_MS int64 = 100
+
+	for !rf.killed() {
+
+		rf.mu.Lock()
+		lastApplied := rf.lastApplied
+		commitIndex := rf.commitIndex
+
+		var entries []LogEntry
+
+		if lastApplied < commitIndex {
+			DPrintf("[%d] Sending entries %d->%d to a client", rf.me, lastApplied+1, commitIndex)
+			entries = append(entries, rf.log[lastApplied+1:commitIndex+1]...)
+		}
+		rf.mu.Unlock()
+
+		for _, entry := range entries {
+			msg := ApplyMsg{}
+			msg.Command = entry.Command
+			msg.CommandIndex = entry.Index
+			msg.CommandValid = true
+
+			rf.ch <- msg
+		}
+
+		rf.mu.Lock()
+		rf.lastApplied = commitIndex
+		rf.mu.Unlock()
+
+		time.Sleep(time.Millisecond * time.Duration(SENDER_TICK_MS))
 	}
 }
 
@@ -757,6 +767,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.clientSender()
 
 	return rf
 }
