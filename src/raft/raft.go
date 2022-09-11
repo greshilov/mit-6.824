@@ -113,8 +113,10 @@ func (rf *Raft) getStateData() []byte {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
-	data := w.Bytes()
-	return data
+	e.Encode(rf.lastIncludedTerm)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastApplied)
+	return w.Bytes()
 }
 
 // save Raft's persistent state to stable storage,
@@ -158,25 +160,31 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var log []LogEntry
+	var lastIncludedTerm int
+	var lastIncludedIndex int
+	var lastApplied int
 
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&log) != nil {
+		d.Decode(&log) != nil ||
+		d.Decode(&lastIncludedTerm) != nil ||
+		d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastApplied) != nil {
 		DPrintf("[%d] Error during read state", rf.me)
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
-
-		for i := range rf.peers {
-			_, entry := rf.getLogEntry(-1)
-			rf.nextIndex[i] = entry.Index
-		}
-
 		_, lastEntry := rf.getLogEntry(-1)
 
-		rf.lastIncludedIndex = lastEntry.Index
-		rf.lastIncludedTerm = lastEntry.Term
+		for i := range rf.peers {
+			rf.nextIndex[i] = lastEntry.Index
+		}
+
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
+		rf.lastApplied = lastIncludedIndex
+		DPrintf("[%d] Recovered with logFirstItem %d, lastItem %d, lastIncludedIndex %d (lastApplied %d)", rf.me, rf.log[0].Index, rf.log[len(rf.log)-1].Index, rf.lastIncludedIndex, lastApplied)
 	}
 }
 
@@ -200,8 +208,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	newSlice := rf.getLogSlice(index, -1)
 
-	rf.persister.SaveStateAndSnapshot(rf.getStateData(), snapshot)
-
 	DPrintf("[%d] Prunning log to index %d, log size %d -> %d", rf.me, index, len(rf.log), len(newSlice))
 
 	_, entry := rf.getLogEntry(index)
@@ -209,7 +215,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	rf.lastIncludedIndex = entry.Index
 	rf.lastIncludedTerm = entry.Term
-	rf.persist()
+
+	rf.persister.SaveStateAndSnapshot(rf.getStateData(), snapshot)
 }
 
 // Append entries RPC
@@ -345,17 +352,13 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	defer rf.mu.Unlock()
 
 	reply.Term = rf.currentTerm
-	_, lastEntry := rf.getLogEntry(-1)
-
 	if args.Term < rf.currentTerm {
 		DPrintf("[%d] Discard install snapshot from %d (%d < %d)", rf.me, args.LeaderId, args.Term, rf.currentTerm)
-	} else if args.LastIncludedIndex < lastEntry.Index {
-		DPrintf("[%d] Delete old entries from log %d < %d", rf.me, args.LastIncludedIndex, lastEntry.Index)
-		rf.log = rf.getLogSlice(args.LastIncludedIndex, -1)
 	} else {
 		DPrintf("[%d] Installing snapshot from %d", rf.me, args.LeaderId)
-		rf.log = make([]LogEntry, 0)
-		rf.log = append(rf.log, LogEntry{args.LastIncludedTerm, args.LastIncludedIndex, Empty{}})
+		rf.log = make([]LogEntry, 1)
+		rf.log[0].Term = args.LastIncludedTerm
+		rf.log[0].Index = args.LastIncludedIndex
 
 		msg := ApplyMsg{}
 		msg.CommandValid = false
@@ -365,8 +368,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		msg.SnapshotIndex = args.LastIncludedIndex
 
 		rf.ch <- msg
+		rf.lastIncludedIndex = args.LastIncludedIndex
+		rf.lastIncludedTerm = args.LastIncludedTerm
 		rf.lastApplied = args.LastIncludedIndex
 		DPrintf("[%d] Setting lastApplied to %d", rf.me, args.LastIncludedIndex)
+		rf.persister.SaveStateAndSnapshot(rf.getStateData(), args.Data)
 	}
 }
 
@@ -586,7 +592,7 @@ func (rf *Raft) broadcastToPeer(peer int) {
 
 			// Send snapshot
 			if !exist {
-				DPrintf("[%d] Sending snapshot to %d, indx %d, lastSnapshotIndx %d\n%d", rf.me, peer, indx-1, rf.lastIncludedIndex, rf.log[0].Index)
+				DPrintf("[%d] Sending snapshot to %d, indx %d, lastSnapshotIndx %d", rf.me, peer, indx-1, rf.lastIncludedIndex)
 				args := InstallSnapshotArgs{}
 
 				args.Term = rf.currentTerm
@@ -846,8 +852,16 @@ func (rf *Raft) clientSender() {
 	for !rf.killed() {
 
 		rf.mu.Lock()
-		lastApplied := max(rf.lastApplied, rf.log[0].Index)
+		lastApplied := rf.lastApplied
 		commitIndex := rf.commitIndex
+
+		exist, _ := rf.getLogEntry(commitIndex)
+
+		if !exist {
+			DPrintf("[%d] Waiting from leader to receive elements (%d is not in log)", rf.me, commitIndex)
+			rf.mu.Unlock()
+			continue
+		}
 
 		var entries []LogEntry
 
