@@ -90,6 +90,8 @@ type Raft struct {
 
 	lastIncludedIndex int
 	lastIncludedTerm  int
+
+	newMessages sync.Cond
 }
 
 // return currentTerm and whether this server
@@ -316,6 +318,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		DPrintf("[%d] Setting commit index to %d", rf.me, endIndex)
 		rf.commitIndex = endIndex
+		rf.newMessages.Broadcast()
 		persist = true
 	}
 
@@ -642,6 +645,7 @@ func (rf *Raft) broadcastToPeer(peer int) {
 					rf.nextIndex[peer] = max(rf.nextIndex[peer], args.Entries[len(args.Entries)-1].Index)
 				}
 				rf.persist()
+				rf.newMessages.Broadcast()
 				return true
 			} else if ok && !response.Success {
 				if response.Term > rf.currentTerm {
@@ -699,29 +703,13 @@ func (rf *Raft) isLeader() bool {
 
 func (rf *Raft) startPing() {
 
-	const LEADER_PING_INTERVAL_MS int = 150
+	const LEADER_PING_INTERVAL_MS int = 100
 
 	for !rf.killed() {
 
-		rf.mu.Lock()
-		state := rf.state
-
-		if state != LEADER {
-			rf.mu.Unlock()
+		if !rf.isLeader() {
 			return
 		}
-
-		// Move commit index if necessary
-		replicatedCommit := getMajority(rf.nextIndex)
-		found, replicatedEntry := rf.getLogEntry(replicatedCommit)
-
-		if replicatedCommit > rf.commitIndex && found && replicatedEntry.Term == rf.currentTerm {
-			DPrintf("[%d] Commiting entry with index %d", rf.me, rf.commitIndex)
-			rf.commitIndex = replicatedCommit
-			rf.persist()
-		}
-
-		rf.mu.Unlock()
 
 		for other, _ := range rf.peers {
 			go rf.broadcastToPeer(other)
@@ -847,11 +835,24 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) clientSender() {
-	const SENDER_TICK_MS int64 = 100
-
 	for !rf.killed() {
 
 		rf.mu.Lock()
+
+		rf.newMessages.Wait()
+
+		if rf.state == LEADER {
+			// Move commit index if necessary
+			replicatedCommit := getMajority(rf.nextIndex)
+			found, replicatedEntry := rf.getLogEntry(replicatedCommit)
+
+			if replicatedCommit > rf.commitIndex && found && replicatedEntry.Term == rf.currentTerm {
+				DPrintf("[%d] Commiting entry with index %d", rf.me, rf.commitIndex)
+				rf.commitIndex = replicatedCommit
+				rf.persist()
+			}
+		}
+
 		lastApplied := rf.lastApplied
 		commitIndex := rf.commitIndex
 
@@ -888,7 +889,7 @@ func (rf *Raft) clientSender() {
 		}
 		rf.mu.Unlock()
 
-		time.Sleep(time.Millisecond * time.Duration(SENDER_TICK_MS))
+		//time.Sleep(time.Millisecond * time.Duration(SENDER_TICK_MS))
 	}
 }
 
@@ -925,6 +926,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 
 	rf.broadcasting = make([]bool, len(rf.peers))
+
+	rf.newMessages = *sync.NewCond(&rf.mu)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
