@@ -644,12 +644,12 @@ func (rf *Raft) broadcastToPeer(peer int) {
 				if len(args.Entries) > 0 {
 					rf.nextIndex[peer] = max(rf.nextIndex[peer], args.Entries[len(args.Entries)-1].Index)
 				}
-				rf.persist()
 				rf.newMessages.Broadcast()
 				return true
 			} else if ok && !response.Success {
 				if response.Term > rf.currentTerm {
 					rf.becomeFollower(response.Term)
+					rf.persist()
 				} else {
 
 					newIndx := max(response.FirstTermId-1, 0)
@@ -660,7 +660,6 @@ func (rf *Raft) broadcastToPeer(peer int) {
 				DPrintf("[%d] Missing RPC response [%d]", rf.me, peer)
 				return false
 			}
-			rf.persist()
 			return false
 		}()
 
