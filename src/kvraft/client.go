@@ -51,7 +51,7 @@ func (ck *Clerk) Get(key string) string {
 	reply := GetReply{}
 
 	ck.callRPC("KVServer.Get", &args, &reply)
-	DPrintf("[kv][client][%d] RPC GET success", ck.leader)
+	DPrintf("[kv][client][%d] RPC GET success '%s'", ck.leader, reply.Value)
 	return reply.Value
 }
 

@@ -11,7 +11,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -45,22 +45,7 @@ type KVServer struct {
 	observer map[int64]chan struct{}
 	storage  map[string]string
 
-	opsMu sync.Mutex
-	ops   map[int64]int64
-}
-
-func (kv *KVServer) opExist(opId int64) bool {
-	kv.opsMu.Lock()
-	defer kv.opsMu.Unlock()
-
-	var _, exists = kv.ops[opId]
-	return exists
-}
-
-func (kv *KVServer) opStore(opId int64) {
-	kv.opsMu.Lock()
-	defer kv.opsMu.Unlock()
-	kv.ops[opId] = time.Now().Unix()
+	ops map[int64]int64
 }
 
 func (kv *KVServer) handleCommand(key string, value string, op string, opId int64) Err {
@@ -71,9 +56,15 @@ func (kv *KVServer) handleCommand(key string, value string, op string, opId int6
 		return ErrWrongLeader
 	} else {
 		DPrintf("[kv][server][%d] Leader received %s index %d", kv.me, op, index)
-		waiter := make(chan struct{})
 
 		kv.mu.Lock()
+		var _, exists = kv.ops[opId]
+		if exists {
+			kv.mu.Unlock()
+			return OK
+		}
+
+		waiter := make(chan struct{})
 		kv.observer[opId] = waiter
 		kv.mu.Unlock()
 
@@ -127,7 +118,6 @@ func (kv *KVServer) handleCommand(key string, value string, op string, opId int6
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	err := kv.handleCommand(args.Key, "", "Get", args.OpId)
-
 	reply.Err = err
 
 	if err == OK {
@@ -139,16 +129,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-
-	if !kv.opExist(args.OpId) {
-		err := kv.handleCommand(args.Key, args.Value, args.Op, args.OpId)
-		reply.Err = err
-		if err == OK {
-			kv.opStore(args.OpId)
-		}
-	} else {
-		reply.Err = OK
-	}
+	err := kv.handleCommand(args.Key, args.Value, args.Op, args.OpId)
+	reply.Err = err
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -180,19 +162,24 @@ func (kv *KVServer) applier() {
 			//log.Printf("[%d] applyCh wait: %d", kv.me, time.Since(start).Milliseconds())
 			//start = time.Now()
 
+			DPrintf("[kv][server][%d] Start processing command %d", kv.me, msg.CommandIndex)
+
 			if msg.CommandValid {
 				op := msg.Command.(Op)
 
 				kv.mu.Lock()
 
-				if !kv.opExist(op.OpId) {
+				var _, exists = kv.ops[op.OpId]
+
+				if !exists {
 					DPrintf("[kv][server][%d] Applying storage[%s] = %s (%s, %d)", kv.me, op.Key, op.Value, op.Type, msg.CommandIndex)
 					if op.Type == "Put" {
 						kv.storage[op.Key] = op.Value
 					} else if op.Type == "Append" { // PutAppend
 						kv.storage[op.Key] = kv.storage[op.Key] + op.Value
 					}
-					kv.opStore(op.OpId)
+
+					kv.ops[op.OpId] = time.Now().Unix()
 				} else {
 					DPrintf("[kv][server][%d] Duplicate op %d", kv.me, op.OpId)
 				}
@@ -202,9 +189,13 @@ func (kv *KVServer) applier() {
 					waiter <- struct{}{}
 					delete(kv.observer, op.OpId)
 					DPrintf("[kv][server][%d] Notification sent %d", kv.me, op.OpId)
+				} else {
+					DPrintf("[kv][server][%d] No notification found for %d", kv.me, op.OpId)
 				}
 				kv.mu.Unlock()
 			}
+
+			DPrintf("[kv][server][%d] Finish processing command %d", kv.me, msg.CommandIndex)
 			//log.Printf("[%d] cycle wait: %d", kv.me, time.Since(start).Milliseconds())
 			//start = time.Now()
 		}
