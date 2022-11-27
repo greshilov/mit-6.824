@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -41,9 +42,11 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	termId   int
-	observer map[int64]chan struct{}
-	storage  map[string]string
+	persister        *raft.Persister
+	termId           int
+	observer         map[int64]chan struct{}
+	storage          map[string]string
+	lastAppliedIndex int
 
 	ops map[int64]int64
 }
@@ -154,17 +157,19 @@ func (kv *KVServer) killed() bool {
 
 func (kv *KVServer) applier() {
 
-	//start := time.Now()
+	// start := time.Now()
 
 	for !kv.killed() {
 
 		for msg := range kv.applyCh {
-			//log.Printf("[%d] applyCh wait: %d", kv.me, time.Since(start).Milliseconds())
-			//start = time.Now()
+			// log.Printf("[%d] applyCh wait: %d", kv.me, time.Since(start).Milliseconds())
+			// start = time.Now()
 
 			DPrintf("[kv][server][%d] Start processing command %d", kv.me, msg.CommandIndex)
 
 			if msg.CommandValid {
+				// Single command
+
 				op := msg.Command.(Op)
 
 				kv.mu.Lock()
@@ -183,6 +188,7 @@ func (kv *KVServer) applier() {
 				} else {
 					DPrintf("[kv][server][%d] Duplicate op %d", kv.me, op.OpId)
 				}
+
 				waiter, ok := kv.observer[op.OpId]
 				if ok {
 					DPrintf("[kv][server][%d] Locked on notification %d", kv.me, op.OpId)
@@ -192,13 +198,60 @@ func (kv *KVServer) applier() {
 				} else {
 					DPrintf("[kv][server][%d] No notification found for %d", kv.me, op.OpId)
 				}
+
+				kv.lastAppliedIndex = msg.CommandIndex
 				kv.mu.Unlock()
+			} else {
+				// Snapshot installation
+				DPrintf("[kv][server][%d] Installing snapshot snapshot index %d", kv.me, msg.SnapshotIndex)
+
+				r := bytes.NewBuffer(msg.Snapshot)
+				d := labgob.NewDecoder(r)
+
+				var storage map[string]string
+				var lastAppliedIndex int
+				var ops map[int64]int64
+
+				if d.Decode(&storage) != nil || d.Decode(&lastAppliedIndex) != nil || d.Decode(&ops) != nil {
+					DPrintf("[%d] Error during read state", kv.me)
+				} else {
+					kv.mu.Lock()
+
+					kv.storage = storage
+					kv.lastAppliedIndex = lastAppliedIndex
+					kv.ops = ops
+					kv.termId = -1
+
+					kv.mu.Unlock()
+				}
+
 			}
 
 			DPrintf("[kv][server][%d] Finish processing command %d", kv.me, msg.CommandIndex)
 			//log.Printf("[%d] cycle wait: %d", kv.me, time.Since(start).Milliseconds())
 			//start = time.Now()
 		}
+	}
+}
+
+func (kv *KVServer) persisterMonitor() {
+	for !kv.killed() {
+
+		kv.mu.Lock()
+
+		if kv.persister.RaftStateSize() > kv.maxraftstate && kv.maxraftstate > 0 {
+			w := new(bytes.Buffer)
+			e := labgob.NewEncoder(w)
+			e.Encode(kv.storage)
+			e.Encode(kv.lastAppliedIndex)
+			e.Encode(kv.ops)
+
+			DPrintf("[kv][server][%d] Raft state reached max, persisting %d bytes", kv.me, w.Len())
+
+			kv.rf.Snapshot(kv.lastAppliedIndex, w.Bytes())
+		}
+		kv.mu.Unlock()
+		time.Sleep(time.Duration(500) * time.Millisecond)
 	}
 }
 
@@ -222,9 +275,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 
 	// You may need initialization code here.
-
+	kv.persister = persister
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.termId = -1
@@ -235,6 +289,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 
 	go kv.applier()
+	go kv.persisterMonitor()
 
 	return kv
 }
