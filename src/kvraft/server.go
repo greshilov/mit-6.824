@@ -243,7 +243,7 @@ func (kv *KVServer) applier() {
 
 func (kv *KVServer) persisterMonitor() {
 
-	PERSISTER_PERIOD := 100
+	PERSISTER_PERIOD := 50
 
 	for !kv.killed() {
 
