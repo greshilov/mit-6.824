@@ -13,6 +13,7 @@ type Clerk struct {
 	mu      sync.Mutex
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	me     int64
 	leader int
 }
 
@@ -28,6 +29,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	// You'll have to add code here.
 	ck.leader = 0
+	ck.me = nrand()
 	return ck
 }
 
@@ -47,6 +49,7 @@ func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
 	args.OpId = nrand()
+	args.CId = ck.me
 
 	reply := GetReply{}
 
@@ -108,16 +111,18 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Value = value
 	args.Op = op
 	args.OpId = nrand()
+	args.CId = ck.me
 
 	reply := PutAppendReply{}
 
 	ck.callRPC("KVServer.PutAppend", &args, &reply)
+
 	DPrintf("[kv][client][%d] RPC PUTAPPEND success", ck.leader)
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	ck.PutAppend(key, value, PUT)
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	ck.PutAppend(key, value, APPEND)
 }

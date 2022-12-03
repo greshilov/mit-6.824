@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -11,7 +12,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -29,6 +30,7 @@ type Op struct {
 	Value string
 	Type  string
 	OpId  int64
+	CId   int64 // ClerkId
 }
 
 type KVServer struct {
@@ -41,15 +43,17 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	termId   int
-	observer map[int64]chan struct{}
-	storage  map[string]string
+	persister *raft.Persister
+	termId    int
+	observer  map[int64]chan struct{}
+	storage   map[string]string
 
-	ops map[int64]int64
+	lastAppliedOp    map[int64]int64 // [client id] -> op id
+	lastAppliedIndex int
 }
 
-func (kv *KVServer) handleCommand(key string, value string, op string, opId int64) Err {
-	index, termId, isLeader := kv.rf.Start(Op{key, value, op, opId})
+func (kv *KVServer) handleCommand(key string, value string, op string, opId int64, cId int64) Err {
+	index, termId, isLeader := kv.rf.Start(Op{key, value, op, opId, cId})
 
 	if !isLeader {
 		DPrintf("[kv][server][%d] WRONG LEADER", kv.me)
@@ -58,8 +62,11 @@ func (kv *KVServer) handleCommand(key string, value string, op string, opId int6
 		DPrintf("[kv][server][%d] Leader received %s index %d", kv.me, op, index)
 
 		kv.mu.Lock()
-		var _, exists = kv.ops[opId]
-		if exists {
+
+		prevOpId, ok := kv.lastAppliedOp[cId]
+
+		if ok && prevOpId == opId {
+			DPrintf("[kv][server][%d] Duplicate operation id %d", kv.me, opId)
 			kv.mu.Unlock()
 			return OK
 		}
@@ -117,7 +124,7 @@ func (kv *KVServer) handleCommand(key string, value string, op string, opId int6
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	err := kv.handleCommand(args.Key, "", "Get", args.OpId)
+	err := kv.handleCommand(args.Key, "", GET, args.OpId, args.CId)
 	reply.Err = err
 
 	if err == OK {
@@ -129,7 +136,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	err := kv.handleCommand(args.Key, args.Value, args.Op, args.OpId)
+	err := kv.handleCommand(args.Key, args.Value, args.Op, args.OpId, args.CId)
 	reply.Err = err
 }
 
@@ -152,37 +159,63 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+func (kv *KVServer) loadFromSnapshot(snapshot []byte) {
+	DPrintf("[kv][server][%d] Loading snapshot", kv.me)
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	var storage map[string]string
+	var lastAppliedIndex int
+	var lastAppliedOp map[int64]int64
+
+	if d.Decode(&storage) != nil || d.Decode(&lastAppliedIndex) != nil || d.Decode(&lastAppliedOp) != nil {
+		DPrintf("[%d] Error during read state", kv.me)
+	} else {
+		kv.mu.Lock()
+
+		kv.storage = storage
+		kv.lastAppliedIndex = lastAppliedIndex
+		kv.lastAppliedOp = lastAppliedOp
+		kv.termId = -1
+
+		kv.mu.Unlock()
+	}
+}
+
 func (kv *KVServer) applier() {
 
-	//start := time.Now()
+	// start := time.Now()
 
 	for !kv.killed() {
 
 		for msg := range kv.applyCh {
-			//log.Printf("[%d] applyCh wait: %d", kv.me, time.Since(start).Milliseconds())
-			//start = time.Now()
+			// log.Printf("[%d] applyCh wait: %d", kv.me, time.Since(start).Milliseconds())
+			// start = time.Now()
 
 			DPrintf("[kv][server][%d] Start processing command %d", kv.me, msg.CommandIndex)
 
 			if msg.CommandValid {
+				// Single command
+
 				op := msg.Command.(Op)
 
 				kv.mu.Lock()
 
-				var _, exists = kv.ops[op.OpId]
+				var lastOpId, exists = kv.lastAppliedOp[op.CId]
 
-				if !exists {
-					DPrintf("[kv][server][%d] Applying storage[%s] = %s (%s, %d)", kv.me, op.Key, op.Value, op.Type, msg.CommandIndex)
-					if op.Type == "Put" {
+				if !exists || lastOpId != op.OpId {
+					DPrintf("[kv][server][%d] Applying storage[%s] = %s (type: %s, cmdindex: %d, opid: %d)", kv.me, op.Key, op.Value, op.Type, msg.CommandIndex, op.OpId)
+					if op.Type == PUT {
 						kv.storage[op.Key] = op.Value
-					} else if op.Type == "Append" { // PutAppend
+					} else if op.Type == APPEND {
 						kv.storage[op.Key] = kv.storage[op.Key] + op.Value
 					}
-
-					kv.ops[op.OpId] = time.Now().Unix()
+					kv.lastAppliedOp[op.CId] = op.OpId
 				} else {
 					DPrintf("[kv][server][%d] Duplicate op %d", kv.me, op.OpId)
 				}
+
 				waiter, ok := kv.observer[op.OpId]
 				if ok {
 					DPrintf("[kv][server][%d] Locked on notification %d", kv.me, op.OpId)
@@ -192,13 +225,45 @@ func (kv *KVServer) applier() {
 				} else {
 					DPrintf("[kv][server][%d] No notification found for %d", kv.me, op.OpId)
 				}
+
+				kv.lastAppliedIndex = msg.CommandIndex
 				kv.mu.Unlock()
+			} else {
+				// Snapshot installation
+				DPrintf("[kv][server][%d] Installing snapshot snapshot index %d", kv.me, msg.SnapshotIndex)
+				kv.loadFromSnapshot(msg.Snapshot)
 			}
 
 			DPrintf("[kv][server][%d] Finish processing command %d", kv.me, msg.CommandIndex)
 			//log.Printf("[%d] cycle wait: %d", kv.me, time.Since(start).Milliseconds())
 			//start = time.Now()
 		}
+	}
+}
+
+func (kv *KVServer) persisterMonitor() {
+
+	PERSISTER_PERIOD := 100
+
+	for !kv.killed() {
+
+		kv.mu.Lock()
+		// now := time.Now().Unix()
+
+		if kv.persister.RaftStateSize() > kv.maxraftstate && kv.maxraftstate > 0 {
+
+			w := new(bytes.Buffer)
+			e := labgob.NewEncoder(w)
+			e.Encode(kv.storage)
+			e.Encode(kv.lastAppliedIndex)
+			e.Encode(kv.lastAppliedOp)
+
+			DPrintf("[kv][server][%d] Raft state reached max, persisting %d bytes, index %d", kv.me, w.Len(), kv.lastAppliedIndex)
+
+			kv.rf.Snapshot(kv.lastAppliedIndex, w.Bytes())
+		}
+		kv.mu.Unlock()
+		time.Sleep(time.Duration(PERSISTER_PERIOD) * time.Millisecond)
 	}
 }
 
@@ -224,17 +289,19 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
-
+	kv.persister = persister
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.termId = -1
 	kv.observer = make(map[int64]chan struct{})
 	kv.storage = make(map[string]string)
-	kv.ops = make(map[int64]int64)
+	kv.lastAppliedOp = make(map[int64]int64)
 
 	// You may need initialization code here.
+	kv.loadFromSnapshot(persister.ReadSnapshot())
 
 	go kv.applier()
+	go kv.persisterMonitor()
 
 	return kv
 }
