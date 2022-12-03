@@ -177,7 +177,6 @@ func (kv *KVServer) loadFromSnapshot(snapshot []byte) {
 		kv.storage = storage
 		kv.lastAppliedIndex = lastAppliedIndex
 		kv.lastAppliedOp = lastAppliedOp
-		kv.termId = -1
 
 		kv.mu.Unlock()
 	}
@@ -245,12 +244,12 @@ func (kv *KVServer) persisterMonitor() {
 
 	PERSISTER_PERIOD := 50
 
-	for !kv.killed() {
+	for !kv.killed() && kv.maxraftstate > 0 {
 
 		kv.mu.Lock()
 		// now := time.Now().Unix()
 
-		if kv.persister.RaftStateSize() > kv.maxraftstate && kv.maxraftstate > 0 {
+		if kv.persister.RaftStateSize() > kv.maxraftstate {
 
 			w := new(bytes.Buffer)
 			e := labgob.NewEncoder(w)
