@@ -473,10 +473,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm {
-		DPrintf("[%d] Discard install snapshot from %d (%d < %d)", rf.me, args.LeaderId, args.Term, rf.currentTerm)
+		rf.DPrintf("Discard install snapshot from %d (%d < %d)", args.LeaderId, args.Term, rf.currentTerm)
 		reply.Success = false
 	} else {
-		DPrintf("[%d] Installing snapshot from %d", rf.me, args.LeaderId)
+		rf.DPrintf("Installing snapshot from %d", args.LeaderId)
 		reply.Success = true
 
 		rf.log = make([]LogEntry, 1)
@@ -495,7 +495,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.lastIncludedIndex = args.LastIncludedIndex
 		rf.lastIncludedTerm = args.LastIncludedTerm
 		rf.lastApplied = args.LastIncludedIndex
-		DPrintf("[%d] Setting lastApplied to %d", rf.me, args.LastIncludedIndex)
+		rf.DPrintf("Setting lastApplied to %d", args.LastIncludedIndex)
 		rf.persister.SaveStateAndSnapshot(rf.getStateData(), args.Data)
 	}
 }
