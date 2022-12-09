@@ -50,13 +50,13 @@ type KVServer struct {
 
 	lastAppliedOp    map[int64]int64 // [client id] -> op id
 	lastAppliedIndex int
+	trimCh           chan struct{}
 }
 
 func (kv *KVServer) handleCommand(key string, value string, op string, opId int64, cId int64) Err {
 	index, termId, isLeader := kv.rf.Start(Op{key, value, op, opId, cId})
 
 	if !isLeader {
-		DPrintf("[kv][server][%d] WRONG LEADER", kv.me)
 		return ErrWrongLeader
 	} else {
 		DPrintf("[kv][server][%d] Leader received %s index %d", kv.me, op, index)
@@ -173,6 +173,7 @@ func (kv *KVServer) loadFromSnapshot(snapshot []byte) {
 		DPrintf("[%d] Error during read state", kv.me)
 	} else {
 		kv.mu.Lock()
+		DPrintf("[kv][server][%d] Applying snapshot lastAppliedIndex %d, lastAppliedOp %o", kv.me, lastAppliedIndex, lastAppliedOp)
 
 		kv.storage = storage
 		kv.lastAppliedIndex = lastAppliedIndex
@@ -200,10 +201,9 @@ func (kv *KVServer) applier() {
 				op := msg.Command.(Op)
 
 				kv.mu.Lock()
-
 				var lastOpId, exists = kv.lastAppliedOp[op.CId]
 
-				if !exists || lastOpId != op.OpId {
+				if (!exists || lastOpId != op.OpId) && msg.CommandIndex > kv.lastAppliedIndex {
 					DPrintf("[kv][server][%d] Applying storage[%s] = %s (type: %s, cmdindex: %d, opid: %d)", kv.me, op.Key, op.Value, op.Type, msg.CommandIndex, op.OpId)
 					if op.Type == PUT {
 						kv.storage[op.Key] = op.Value
@@ -211,6 +211,9 @@ func (kv *KVServer) applier() {
 						kv.storage[op.Key] = kv.storage[op.Key] + op.Value
 					}
 					kv.lastAppliedOp[op.CId] = op.OpId
+
+					DPrintf("[kv][server][%d] Setting lastAppliedIndex to %d", kv.me, msg.CommandIndex)
+					kv.lastAppliedIndex = msg.CommandIndex
 				} else {
 					DPrintf("[kv][server][%d] Duplicate op %d", kv.me, op.OpId)
 				}
@@ -225,7 +228,9 @@ func (kv *KVServer) applier() {
 					DPrintf("[kv][server][%d] No notification found for %d", kv.me, op.OpId)
 				}
 
-				kv.lastAppliedIndex = msg.CommandIndex
+				go func() {
+					kv.trimCh <- struct{}{}
+				}()
 				kv.mu.Unlock()
 			} else {
 				// Snapshot installation
@@ -241,14 +246,14 @@ func (kv *KVServer) applier() {
 }
 
 func (kv *KVServer) persisterMonitor() {
-
-	PERSISTER_PERIOD := 50
+	//lastCalledIndex := 0
 
 	for !kv.killed() && kv.maxraftstate > 0 {
+		<-kv.trimCh
 
 		kv.mu.Lock()
-		// now := time.Now().Unix()
 
+		// now := time.Now().Unix()
 		if kv.persister.RaftStateSize() > kv.maxraftstate {
 
 			w := new(bytes.Buffer)
@@ -260,9 +265,9 @@ func (kv *KVServer) persisterMonitor() {
 			DPrintf("[kv][server][%d] Raft state reached max, persisting %d bytes, index %d", kv.me, w.Len(), kv.lastAppliedIndex)
 
 			kv.rf.Snapshot(kv.lastAppliedIndex, w.Bytes())
+			//lastCalledIndex = kv.lastAppliedIndex
 		}
 		kv.mu.Unlock()
-		time.Sleep(time.Duration(PERSISTER_PERIOD) * time.Millisecond)
 	}
 }
 
@@ -291,10 +296,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.persister = persister
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
 	kv.termId = -1
 	kv.observer = make(map[int64]chan struct{})
 	kv.storage = make(map[string]string)
 	kv.lastAppliedOp = make(map[int64]int64)
+	kv.trimCh = make(chan struct{})
 
 	// You may need initialization code here.
 	kv.loadFromSnapshot(persister.ReadSnapshot())

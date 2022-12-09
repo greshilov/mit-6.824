@@ -152,23 +152,21 @@ func (rf *Raft) readPersist(data []byte) {
 
 	var currentTerm int
 	var votedFor int
-	var log []LogEntry
+	var logEntries []LogEntry
 	var lastIncludedTerm int
 	var lastIncludedIndex int
-	var lastApplied int
 
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&log) != nil ||
+		d.Decode(&logEntries) != nil ||
 		d.Decode(&lastIncludedTerm) != nil ||
-		d.Decode(&lastIncludedIndex) != nil ||
-		d.Decode(&lastApplied) != nil {
+		d.Decode(&lastIncludedIndex) != nil {
 		rf.DPrintf("Error during read state")
 	} else {
 		rf.mu.Lock()
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
-		rf.log = log
+		rf.log = logEntries
 		_, lastEntry := rf.getLogEntry(-1)
 
 		for i := range rf.peers {
@@ -179,7 +177,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.lastIncludedTerm = lastIncludedTerm
 		rf.lastApplied = lastIncludedIndex
 
-		rf.DPrintf("Recovered with logFirstItem %d, lastItem %d, lastIncludedIndex %d (lastApplied %d)", rf.log[0].Index, rf.log[len(rf.log)-1].Index, rf.lastIncludedIndex, lastApplied)
+		rf.DPrintf("Recovered with logFirstItem %d, lastItem %d, lastIncludedIndex %d", rf.log[0].Index, rf.log[len(rf.log)-1].Index, rf.lastIncludedIndex)
 		rf.mu.Unlock()
 	}
 }
@@ -202,12 +200,17 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// Don't prune lower than current commit
-	index = min(index, rf.commitIndex)
+	firstIndex := rf.log[0].Index
+
+	if index < firstIndex {
+		// This happens because client haven't yet read snapshot apply msg
+		// and is trying to prune with incorrect index
+		DPrintf("Invalid prunning index %d < %d (first index in the log)", index, firstIndex)
+		return
+	}
 
 	newSlice := rf.getLogSlice(index, -1)
-
-	DPrintf("[%d] Prunning log to index %d, log size %d -> %d", rf.me, index, len(rf.log), len(newSlice))
+	rf.DPrintf("Prunning log to index %d, log size %d -> %d", index, len(rf.log), len(newSlice))
 
 	_, entry := rf.getLogEntry(index)
 	rf.log = newSlice
@@ -618,7 +621,6 @@ func (rf *Raft) getStateData() []byte {
 	e.Encode(rf.log)
 	e.Encode(rf.lastIncludedTerm)
 	e.Encode(rf.lastIncludedIndex)
-	e.Encode(rf.lastApplied)
 	return w.Bytes()
 }
 
@@ -667,8 +669,12 @@ func (rf *Raft) getLogSize() int {
 
 func (rf *Raft) notifyPeer(peer int, command PeerNotify) {
 	// See peerSender()
+	rf.mu.Lock()
+	ch := rf.peerCh[peer]
+	rf.mu.Unlock()
+
 	if peer != rf.me {
-		rf.peerCh[peer] <- command
+		ch <- command
 	}
 }
 
@@ -831,6 +837,11 @@ func (rf *Raft) peerSender(peer int) {
 			ok, success, term := rf.sendInstallSnapshot(peer, &args)
 
 			rf.mu.Lock()
+			if ok {
+				// Resseting last beat
+				rf.lastBeatFromPeer = time.Now()
+			}
+
 			if ok && success {
 				rf.DPrintf("Snapshot is sent succesfully, setting index %d for [%d]", rf.lastIncludedIndex, peer)
 				rf.nextIndex[peer] = rf.lastIncludedIndex
@@ -876,7 +887,7 @@ func (rf *Raft) peerSender(peer int) {
 
 			if !success && rf.currentTerm >= term {
 				newIndx := max(firstTermId-1, 0)
-				rf.DPrintf("[%d] Decreasing index %d -> %d for [%d]", rf.me, rf.nextIndex[peer], newIndx, peer)
+				rf.DPrintf("Decreasing index %d -> %d for [%d]", rf.nextIndex[peer], newIndx, peer)
 				rf.nextIndex[peer] = newIndx
 				rf.persist()
 			}
@@ -926,8 +937,10 @@ func (rf *Raft) runLeader() {
 		rf.nextIndex[i] = entry.Index
 	}
 
+	// Reset peer senders
 	for peer := range rf.peers {
 		if peer != rf.me {
+			rf.peerCh[peer] = make(chan PeerNotify)
 			go rf.peerSender(peer)
 		}
 	}
@@ -955,11 +968,22 @@ func (rf *Raft) runLeader() {
 	}
 
 	rf.DPrintf("Shutdown runLeader()")
-	// TODO: Use WaitGroup to properly shutdown all peerSenders
 
+	// TODO: Use WaitGroup to properly shutdown all peerSenders
+	// Graceful shutdown (kind of)
+	rf.mu.Lock()
 	for peer := range rf.peers {
-		go rf.notifyPeer(peer, EXIT)
+
+		// Asynchronously wait for peer to exit
+		go func(ch chan PeerNotify) {
+			ch <- EXIT
+			close(ch)
+		}(rf.peerCh[peer])
+
+		// Remove reference from raft
+		rf.peerCh[peer] = nil
 	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) clientSender() {

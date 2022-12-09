@@ -54,7 +54,6 @@ func (ck *Clerk) Get(key string) string {
 	reply := GetReply{}
 
 	ck.callRPC("KVServer.Get", &args, &reply)
-	DPrintf("[kv][client][%d] RPC GET success '%s'", ck.leader, reply.Value)
 	return reply.Value
 }
 
@@ -73,11 +72,9 @@ func (ck *Clerk) callRPC(rpc string, args interface{}, reply Reply) {
 				DPrintf("[kv][client][%d] Timeout", i)
 				continue
 			default:
-				DPrintf("[kv][client][%d] Making call %s", i, rpc)
 				ok := ck.servers[i].Call(rpc, args, reply)
 
 				if !ok || !reply.isSuccess() {
-					DPrintf("[kv][client][%d] No success ok: %t reply %s", i, ok, reply)
 					continue
 				} else {
 
@@ -116,8 +113,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	reply := PutAppendReply{}
 
 	ck.callRPC("KVServer.PutAppend", &args, &reply)
-
-	DPrintf("[kv][client][%d] RPC PUTAPPEND success", ck.leader)
 }
 
 func (ck *Clerk) Put(key string, value string) {
