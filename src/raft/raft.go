@@ -392,7 +392,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if entry.Index < rf.getLogSize() {
 			// Overwrite entries
 			_, logEntry := rf.getLogEntry(entry.Index)
-			if logEntry != entry {
+			if logEntry.Term != entry.Term {
 
 				rf.DPrintf("Received entry, overwriting since index %d from [%d]", entry.Index, args.LeaderId)
 				rf.log = rf.getLogSlice(-1, entry.Index)
@@ -811,7 +811,14 @@ func (rf *Raft) runCandidate() {
 
 func (rf *Raft) peerSender(peer int) {
 	for !rf.killed() && rf.getRaftState() == LEADER {
-		command := <-rf.peerCh[peer]
+
+		// To avoid data race in case of peer death
+		rf.mu.Lock()
+		ch := rf.peerCh[peer]
+		rf.mu.Unlock()
+
+		command := <-ch
+
 		if command == EXIT {
 			rf.DPrintf("Received exit for peer [%d]", peer)
 			return
