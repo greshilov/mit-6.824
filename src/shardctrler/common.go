@@ -1,5 +1,7 @@
 package shardctrler
 
+import "fmt"
+
 //
 // Shard controler: assigns shards to replication groups.
 //
@@ -28,13 +30,21 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func (conf *Config) ToString() string {
+	return fmt.Sprintf("Conf(num: %d, shards: %v, groups: %v}", conf.Num, conf.Shards, conf.Groups)
+}
+
 const (
-	OK = "OK"
+	OK             Err = "OK"
+	ErrPartitioned Err = "ERR_PARTITIONED"
+	ErrWrongLeader Err = "ERR_WRONG_LEADER"
 )
 
 type Err string
 
 type JoinArgs struct {
+	OpId    int64
+	CId     int64
 	Servers map[int][]string // new GID -> servers mappings
 }
 
@@ -44,6 +54,8 @@ type JoinReply struct {
 }
 
 type LeaveArgs struct {
+	OpId int64
+	CId  int64
 	GIDs []int
 }
 
@@ -53,6 +65,8 @@ type LeaveReply struct {
 }
 
 type MoveArgs struct {
+	OpId  int64
+	CId   int64
 	Shard int
 	GID   int
 }
@@ -63,7 +77,9 @@ type MoveReply struct {
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	OpId int64
+	CId  int64
+	Num  int // desired config number
 }
 
 type QueryReply struct {
