@@ -10,12 +10,16 @@ package shardkv
 //
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
-	ErrPartitioned = "ErrPartitioned"
-	ErrWrongConfig = "ErrWrongConfig"
+	OK                = "OK"
+	ErrNoKey          = "ErrNoKey"
+	ErrInvalidMsgBody = "ErrInvalidMsgBody"
+	ErrOldMsg         = "ErrOldMsg"
+	ErrUnknownCmd     = "ErrUnknownCmd"
+	ErrWrongState     = "ErrWrongState"
+	ErrWrongGroup     = "ErrWrongGroup"
+	ErrWrongLeader    = "ErrWrongLeader"
+	ErrPartitioned    = "ErrPartitioned"
+	ErrWrongConfig    = "ErrWrongConfig"
 )
 
 type Err string
