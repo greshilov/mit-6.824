@@ -59,6 +59,7 @@ type MigrateShardArgs struct {
 }
 
 type MigrateShardReply struct {
-	Data map[string]string
-	Err  Err
+	Data    map[string]string
+	LastOps map[int64]int
+	Err     Err
 }

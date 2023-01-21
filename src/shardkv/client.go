@@ -116,6 +116,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
+
+				//fmt.Printf("[client] Call PutAppend %s: %s gid %d, si %d\n", args.Key, args.Value, gid, si)
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
 					return
@@ -123,6 +125,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				if ok && reply.Err == ErrWrongGroup {
 					break
 				}
+				//fmt.Printf("[client] Error PutAppend %s: %s gid %d, si %d, err: %s\n", args.Key, args.Value, gid, si, reply.Err)
 				// ... not ok, or ErrWrongLeader
 			}
 		}

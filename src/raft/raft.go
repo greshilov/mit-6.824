@@ -493,7 +493,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		msg.SnapshotTerm = args.LastIncludedTerm
 		msg.SnapshotIndex = args.LastIncludedIndex
 
-		rf.applyCh <- msg
+		defer func(msg ApplyMsg) {
+			rf.applyCh <- msg
+		}(msg)
 
 		rf.lastIncludedIndex = args.LastIncludedIndex
 		rf.lastIncludedTerm = args.LastIncludedTerm

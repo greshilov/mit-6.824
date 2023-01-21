@@ -14,7 +14,7 @@ import (
 	"6.824/shardctrler"
 )
 
-const Debug = true
+const Debug = false
 
 type KVCommand string
 type ServerState string
@@ -40,11 +40,11 @@ type Op struct {
 	CmdArgs []byte
 	OpId    int64
 	CId     int64 // ClerkId
-	ShardId int
+	Key     string
 }
 
 func (op *Op) ToString() string {
-	return fmt.Sprintf("{typ: %s, opId: %d, cId: %d, shardId: %d}", op.Cmd, op.OpId, op.CId, op.ShardId)
+	return fmt.Sprintf("{typ: %s, opId: %d, cId: %d, shardId: %d}", op.Cmd, op.OpId, op.CId, key2shard(op.Key))
 }
 
 type ShardKV struct {
@@ -62,11 +62,13 @@ type ShardKV struct {
 	storage          map[string]string
 	termId           int
 	observer         map[int64]chan Err
-	lastAppliedOp    map[int64]int64 // [client id] -> op id
+	appliedOp        map[int64]int // [op id] -> config num
 	lastAppliedIndex int
 	trimCh           chan struct{}
+	lastTrimAt       time.Time
 	persister        *raft.Persister
 	mck              *shardctrler.Clerk
+	configId         int32 // for logging
 	config           shardctrler.Config
 	state            ServerState
 }
@@ -83,7 +85,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		w.Bytes(),
 		args.OpId,
 		args.CId,
-		key2shard(args.Key),
+		args.Key,
 	}
 
 	err := kv.handleCommand(op)
@@ -116,50 +118,53 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		w.Bytes(),
 		args.OpId,
 		args.CId,
-		key2shard(args.Key),
+		args.Key,
 	}
 
 	err := kv.handleCommand(op)
 	reply.Err = err
 }
 
-func (kv *ShardKV) requestMigrateShard(gid int, shard int) map[string]string {
+func (kv *ShardKV) requestMigrateShard(gid int, shard int) MigrateShardReply {
 	kv.mu.Lock()
 	currentConfig := kv.config.Num
-	servers, ok := kv.config.Groups[gid]
+	servers := kv.config.Groups[gid]
 	kv.mu.Unlock()
 
 	kv.DPrintf("Requesting shard %d from %d (servers: %v)", shard, gid, servers)
 
 	for !kv.killed() {
-		if ok {
-			// try each server for the shard.
-			for si := 0; si < len(servers); si++ {
+		for si := 0; si < len(servers); si++ {
+			srv := kv.make_end(servers[si])
+			args := MigrateShardArgs{currentConfig, shard}
 
-				select {
-				case <-time.After(500 * time.Millisecond):
-					kv.DPrintf("RPC Timeout")
-					continue
-				default:
-					srv := kv.make_end(servers[si])
+			var reply MigrateShardReply
 
-					args := MigrateShardArgs{currentConfig, shard}
+			kv.DPrintf("requestMigrateShard gid: %d, shard: %d, server %d", gid, shard, si)
 
-					var reply MigrateShardReply
-					ok := srv.Call("ShardKV.MigrateShard", &args, &reply)
-					if ok && reply.Err == OK {
-						return reply.Data
-					}
+			ch := make(chan bool)
+			go func() {
+				ch <- srv.Call("ShardKV.MigrateShard", &args, &reply)
+			}()
 
-					kv.DPrintf("Unsuccessful shard transmission %d (%b, %s)", gid, ok, reply.Err)
-					// ... not ok, or ErrWrongLeader
+			select {
+			case ok := <-ch:
+				if ok && reply.Err == OK {
+					kv.DPrintf("Return requestMigrateShard gid: %d, shard: %d, server: %d", gid, shard, si)
+					return reply
 				}
+				kv.DPrintf("requestMigrateShard unsuccessful %d (%b, %s)", gid, ok, reply.Err)
+
+			case <-time.After(100 * time.Millisecond):
+				kv.DPrintf("requestMigrateShard timeout gid: %d, shard: %d, server: %d", gid, shard, si)
+				continue
 			}
+			// ... not ok, or ErrWrongLeader
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	return nil
+	return MigrateShardReply{}
 }
 
 func (kv *ShardKV) MigrateShard(args *MigrateShardArgs, reply *MigrateShardReply) {
@@ -173,21 +178,33 @@ func (kv *ShardKV) MigrateShard(args *MigrateShardArgs, reply *MigrateShardReply
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	// requester config must be the same or -1
+	// requester config must be the same or less
 	if (kv.config.Num == args.ConfigNum && kv.state == ShardMigration) || kv.config.Num > args.ConfigNum {
-		response := make(map[string]string)
+
+		kv.DPrintf("MigrateShard success %d, config %d", args.Shard, args.ConfigNum)
+		responseData := make(map[string]string)
+		responseLastOps := make(map[int64]int)
 
 		for k, v := range kv.storage {
 			shardId := key2shard(k)
 
 			if shardId == args.Shard {
-				response[k] = v
+				responseData[k] = v
 			}
 		}
+
+		for opId, configId := range kv.appliedOp {
+
+			if opId >= 0 {
+				responseLastOps[opId] = configId
+			}
+		}
+
 		reply.Err = OK
-		reply.Data = response
+		reply.Data = responseData
+		reply.LastOps = responseLastOps
 	} else {
-		kv.DPrintf("Wrong config number state: %s, my config: %d, requester config: %d", kv.state, kv.config.Num, args.ConfigNum)
+		kv.DPrintf("MigrateShard failed wrong config and state %d, config %d", args.Shard, args.ConfigNum)
 		reply.Err = ErrWrongConfig
 	}
 }
@@ -207,15 +224,10 @@ func (kv *ShardKV) Kill() {
 func (kv *ShardKV) DPrintf(format string, a ...interface{}) {
 	if Debug {
 
-		_, isLeader := kv.rf.GetState()
-		var leader string
+		//_, isLeader := kv.rf.GetState()
 
-		if isLeader {
-			leader = "[LEADER]"
-		} else {
-			leader = ""
-		}
-		str := fmt.Sprintf("[shardkv][%d][%d][c: %d]%s %s", kv.gid, kv.me, kv.config.Num, leader, format)
+		//str := fmt.Sprintf("[shardkv][%d][%d][c: %d]%s %s", kv.gid, kv.me, kv.config.Num, leader, format)
+		str := fmt.Sprintf("[shardkv][%d][%d][c: %d] %s", kv.gid, kv.me, atomic.LoadInt32(&kv.configId), format)
 
 		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 		log.Printf(str, a...)
@@ -230,7 +242,7 @@ func (kv *ShardKV) killed() bool {
 func (kv *ShardKV) isMyShard(op Op) bool {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	return kv.config.Num != 0 && kv.config.Shards[op.ShardId] == kv.gid
+	return kv.config.Num != 0 && kv.config.Shards[key2shard(op.Key)] == kv.gid
 }
 
 func (kv *ShardKV) applier() {
@@ -283,90 +295,108 @@ func (kv *ShardKV) dispatchMsg(msg raft.ApplyMsg, op Op) Err {
 		return ErrOldMsg
 	}
 
-	var lastOpId, exists = kv.lastAppliedOp[op.CId]
-	kv.DPrintf("Exist: %b, lastOpId: %d, op: %s", exists, lastOpId, op.ToString())
-	if !exists || lastOpId != op.OpId {
+	_, ok := kv.appliedOp[op.OpId]
 
-		switch op.Cmd {
-		case Get:
-			r := bytes.NewBuffer(op.CmdArgs)
-			d := labgob.NewDecoder(r)
+	if ok {
+		kv.DPrintf("Duplicate operation id %d", op.OpId)
+		return OK
+	}
 
-			var getArgs GetArgs
+	kv.DPrintf("Processing command: %s", op.ToString())
+	switch op.Cmd {
+	case Get:
+		r := bytes.NewBuffer(op.CmdArgs)
+		d := labgob.NewDecoder(r)
 
-			if d.Decode(&getArgs) != nil {
-				kv.DPrintf("Invalid GetArgs bytes, skipping")
-				return ErrInvalidMsgBody
-			} else {
-				kv.DPrintf("Processing Get command: %s", op.ToString())
-			}
-		case Put:
-			r := bytes.NewBuffer(op.CmdArgs)
-			d := labgob.NewDecoder(r)
+		var getArgs GetArgs
 
-			var putArgs PutAppendArgs
+		if d.Decode(&getArgs) != nil {
+			kv.DPrintf("Invalid GetArgs bytes, skipping")
+			return ErrInvalidMsgBody
+		} else {
+			kv.DPrintf("Processing Get command: %s", op.ToString())
+		}
+	case Put:
+		r := bytes.NewBuffer(op.CmdArgs)
+		d := labgob.NewDecoder(r)
 
-			if d.Decode(&putArgs) != nil {
-				kv.DPrintf("Invalid PutArgs bytes, skipping %s", op.ToString())
-				return ErrInvalidMsgBody
-			} else {
-				kv.DPrintf("PUT %s -> %s", putArgs.Key, putArgs.Value)
-				kv.storage[putArgs.Key] = putArgs.Value
-			}
-		case Append:
-			r := bytes.NewBuffer(op.CmdArgs)
-			d := labgob.NewDecoder(r)
+		var putArgs PutAppendArgs
 
-			var appendArgs PutAppendArgs
+		if d.Decode(&putArgs) != nil {
+			kv.DPrintf("Invalid PutArgs bytes, skipping %s", op.ToString())
+			return ErrInvalidMsgBody
+		} else {
+			kv.DPrintf("PUT %s -> %s", putArgs.Key, putArgs.Value)
+			kv.storage[putArgs.Key] = putArgs.Value
+		}
+	case Append:
+		r := bytes.NewBuffer(op.CmdArgs)
+		d := labgob.NewDecoder(r)
 
-			if d.Decode(&appendArgs) != nil {
-				kv.DPrintf("Invalid AppendArgs bytes, skipping %s", op.ToString())
-				return ErrInvalidMsgBody
-			} else {
-				kv.DPrintf("APPEND %s -> %s", appendArgs.Key, appendArgs.Value)
-				kv.storage[appendArgs.Key] = kv.storage[appendArgs.Key] + appendArgs.Value
-			}
-		case ConfigChange:
-			r := bytes.NewBuffer(op.CmdArgs)
-			d := labgob.NewDecoder(r)
+		var appendArgs PutAppendArgs
 
-			var config shardctrler.Config
-			if d.Decode(&config) != nil {
-				kv.DPrintf("Invalid ConfigChange bytes, skipping %s", op.ToString())
-				return ErrInvalidMsgBody
-			} else {
-				kv.state = ShardMigration
-				kv.DPrintf("Config change %d -> %d", kv.config.Num, config.Num)
-				for shard, gid := range config.Shards {
-					// Detect we have to request our shard from another replica group
-					if gid == kv.gid && kv.config.Num > 0 && kv.config.Shards[shard] != gid {
-						kv.mu.Unlock()
-						data := kv.requestMigrateShard(kv.config.Shards[shard], shard)
-						kv.mu.Lock()
+		if d.Decode(&appendArgs) != nil {
+			kv.DPrintf("Invalid AppendArgs bytes, skipping %s", op.ToString())
+			return ErrInvalidMsgBody
+		} else {
+			kv.DPrintf("APPEND %s -> %s", appendArgs.Key, appendArgs.Value)
+			kv.storage[appendArgs.Key] = kv.storage[appendArgs.Key] + appendArgs.Value
+			kv.DPrintf("KEY %s = %s", appendArgs.Key, kv.storage[appendArgs.Key])
 
-						kv.DPrintf("Adding %d keys from %d", len(data), kv.config.Shards[shard])
-						for k, v := range data {
-							kv.storage[k] = v
+		}
+	case ConfigChange:
+		r := bytes.NewBuffer(op.CmdArgs)
+		d := labgob.NewDecoder(r)
+
+		var config shardctrler.Config
+		if d.Decode(&config) != nil {
+			kv.DPrintf("Invalid ConfigChange bytes, skipping %s", op.ToString())
+			return ErrInvalidMsgBody
+		} else if config.Num < kv.config.Num {
+			kv.DPrintf("Stale config num %d, ignoring...", config.Num)
+			return ErrWrongConfig
+		} else {
+			kv.state = ShardMigration
+			kv.DPrintf("Config change %d -> %d", kv.config.Num, config.Num)
+			for shard, gid := range config.Shards {
+				// Detect we have to request our shard from another replica group
+				if gid == kv.gid && kv.config.Num > 0 && kv.config.Shards[shard] != gid {
+					kv.mu.Unlock()
+					reply := kv.requestMigrateShard(kv.config.Shards[shard], shard)
+					kv.mu.Lock()
+
+					kv.DPrintf("Adding %d keys from %d", len(reply.Data), kv.config.Shards[shard])
+					for k, v := range reply.Data {
+						kv.storage[k] = v
+					}
+
+					for opId, configId := range reply.LastOps {
+
+						// Ugly hack
+						if configId > kv.config.Num {
+							continue
+						}
+
+						if _, ok := kv.appliedOp[opId]; !ok {
+							kv.appliedOp[opId] = configId
 						}
 					}
 				}
-
-				kv.DPrintf("Comitting config %d", config.Num)
-				kv.config = config
-				kv.state = Operational
 			}
-		default:
-			kv.DPrintf("Unknown command type: %s", op.Cmd)
-			return ErrUnknownCmd
-		}
 
-		kv.DPrintf("Setting lastApplied [%d] -> %d", op.CId, op.OpId)
-		kv.lastAppliedOp[op.CId] = op.OpId
-		kv.lastAppliedIndex = msg.CommandIndex
-	} else {
-		kv.DPrintf("Duplicate op %d", op.OpId)
+			kv.DPrintf("Comitting config %d", config.Num)
+			kv.config = config
+			atomic.StoreInt32(&kv.configId, int32(config.Num))
+			kv.state = Operational
+		}
+	default:
+		kv.DPrintf("Unknown command type: %s", op.Cmd)
+		return ErrUnknownCmd
 	}
 
+	kv.DPrintf("Setting lastApplied [%s] -> %d", op.Key, op.OpId)
+	kv.appliedOp[op.OpId] = kv.config.Num
+	kv.lastAppliedIndex = msg.CommandIndex
 	return OK
 }
 
@@ -377,14 +407,10 @@ func (kv *ShardKV) configWatcher() {
 
 		kv.mu.Lock()
 		state := kv.state
+		nextNum := kv.config.Num + 1
 		kv.mu.Unlock()
 
 		if isLeader && state == Operational {
-
-			kv.mu.Lock()
-			nextNum := kv.config.Num + 1
-			kv.mu.Unlock()
-
 			config := kv.mck.Query(nextNum)
 
 			if config.Num == nextNum {
@@ -398,18 +424,12 @@ func (kv *ShardKV) configWatcher() {
 				op := Op{
 					ConfigChange,
 					w.Bytes(),
-					int64(config.Num), // Probably not very wise OpId choice
+					int64(config.Num) * (-1), // Probably not very wise OpId choice
 					-1,
-					-1,
+					"",
 				}
 
-				kv.state = ShardMigration
-				res := kv.handleCommand(op)
-
-				if res != OK {
-					kv.DPrintf("Migration OP result is %s, rolling back", res)
-					kv.state = Operational
-				}
+				kv.handleCommand(op)
 			}
 		}
 		time.Sleep(time.Duration(100) * time.Millisecond)
@@ -417,23 +437,33 @@ func (kv *ShardKV) configWatcher() {
 }
 
 func (kv *ShardKV) persisterMonitor() {
+
+	const PERSISTER_DEBOUNCER = 50 * time.Millisecond
+
+	kv.DPrintf("Persister monitor started %d", kv.maxraftstate)
+
 	for !kv.killed() && kv.maxraftstate > 0 {
 		<-kv.trimCh
 
 		kv.mu.Lock()
 
-		if kv.persister.RaftStateSize() > kv.maxraftstate && kv.state == Operational {
+		kv.DPrintf("Time passed since persistance: %v", time.Since(kv.lastTrimAt))
+		if kv.persister.RaftStateSize() > kv.maxraftstate && kv.state == Operational && time.Since(kv.lastTrimAt) > PERSISTER_DEBOUNCER {
 
 			w := new(bytes.Buffer)
 			e := labgob.NewEncoder(w)
 			e.Encode(kv.storage)
 			e.Encode(kv.lastAppliedIndex)
-			e.Encode(kv.lastAppliedOp)
+			e.Encode(kv.appliedOp)
 			e.Encode(kv.config)
 
-			kv.DPrintf("Raft state reached max, persisting %d bytes, index %d", w.Len(), kv.lastAppliedIndex)
+			kv.DPrintf("Raft state reached max %d bytes, index %d", kv.persister.RaftStateSize(), kv.lastAppliedIndex)
 
 			kv.rf.Snapshot(kv.lastAppliedIndex, w.Bytes())
+
+			kv.lastTrimAt = time.Now()
+
+			kv.DPrintf("Raft state became %d bytes", kv.persister.RaftStateSize())
 		}
 		kv.mu.Unlock()
 	}
@@ -447,19 +477,20 @@ func (kv *ShardKV) loadFromSnapshot(snapshot []byte) {
 
 	var storage map[string]string
 	var lastAppliedIndex int
-	var lastAppliedOp map[int64]int64
+	var appliedOp map[int64]int
 	var config shardctrler.Config
 
-	if d.Decode(&storage) != nil || d.Decode(&lastAppliedIndex) != nil || d.Decode(&lastAppliedOp) != nil || d.Decode(&config) != nil {
+	if d.Decode(&storage) != nil || d.Decode(&lastAppliedIndex) != nil || d.Decode(&appliedOp) != nil || d.Decode(&config) != nil {
 		kv.DPrintf("Error during read state")
 	} else {
 		kv.mu.Lock()
-		kv.DPrintf("Applying snapshot lastAppliedIndex %d, lastAppliedOp %v, config %s", lastAppliedIndex, lastAppliedOp, config.ToString())
+		kv.DPrintf("Applying snapshot lastAppliedIndex %d, lastAppliedOp size %d, config %s", lastAppliedIndex, len(appliedOp), config.ToString())
 
 		kv.storage = storage
 		kv.lastAppliedIndex = lastAppliedIndex
-		kv.lastAppliedOp = lastAppliedOp
+		kv.appliedOp = appliedOp
 		kv.config = config
+		atomic.StoreInt32(&kv.configId, int32(config.Num))
 
 		kv.mu.Unlock()
 	}
@@ -479,9 +510,9 @@ func (kv *ShardKV) handleCommand(op Op) Err {
 
 		kv.mu.Lock()
 
-		prevOpId, ok := kv.lastAppliedOp[op.CId]
+		_, ok := kv.appliedOp[op.OpId]
 
-		if ok && prevOpId == op.OpId {
+		if ok {
 			kv.DPrintf("Duplicate operation id %d", op.OpId)
 			kv.mu.Unlock()
 			return OK
@@ -562,6 +593,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(GetArgs{})
+	labgob.Register(PutAppendArgs{})
+	labgob.Register(shardctrler.Config{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -571,10 +605,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.ctrlers = ctrlers
 
 	// Your initialization code here.
-
-	labgob.Register(GetArgs{})
-	labgob.Register(PutAppendArgs{})
-	labgob.Register(Op{})
 
 	// Use something like this to talk to the shardctrler:
 	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
@@ -587,8 +617,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.termId = -1
 	kv.observer = make(map[int64]chan Err)
-	kv.lastAppliedOp = make(map[int64]int64)
+	kv.appliedOp = make(map[int64]int)
 	kv.trimCh = make(chan struct{})
+	kv.lastTrimAt = time.Now()
 	kv.storage = make(map[string]string)
 	kv.state = Operational
 
